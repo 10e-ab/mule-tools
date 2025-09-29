@@ -38,14 +38,11 @@ All tools include built-in support for desktop notifications when used with **mu
 ### Required Environment Variables
 
 ```bash
-# Mule runtime server location (required for deploy/undeploy)
+# Mule runtime server location (required for deploy-to-local and undeploy-from-local commands)
 export MULE_SERVER_HOME="/path/to/mule-runtime"
 
-# Mule projects directory (optional, for app name completion)
+# Mule projects directory (optional, used by deploy-to-local for app name completion)
 export MULE_PROJECTS_HOME="/path/to/mule/projects"
-
-# Mule installation (optional, for clear-data functionality)
-export MULE_HOME="/path/to/mule/installation"
 ```
 
 ## Installation
