@@ -1,0 +1,461 @@
+#!/bin/bash
+
+# Local deployment script for Mule applications
+# Updates local.properties, builds, and deploys to $MULE_SERVER_HOME/apps
+
+# Function to show usage
+show_usage() {
+    echo "Usage: $(basename "$0") [OPTIONS] [APP_NAME]"
+    echo ""
+    echo "Deploy a Mule application to local server"
+    echo ""
+    echo "Options:"
+    echo "  -l, --list    List available applications from \$MULE_PROJECTS_HOME"
+    echo "  -h, --help    Show this help message"
+    echo ""
+    echo "Arguments:"
+    echo "  APP_NAME      Name of the application to deploy (optional)"
+    echo "                If not provided, uses the current directory"
+    echo ""
+    echo "Examples:"
+    echo "  $(basename "$0")                  # Deploy from current directory"
+    echo "  $(basename "$0") customer-sapi     # Deploy customer-sapi from \$MULE_PROJECTS_HOME"
+    echo "  $(basename "$0") --list            # List available applications"
+}
+
+# Function to list available applications
+list_applications() {
+    if [ -z "$MULE_PROJECTS_HOME" ]; then
+        echo "Error: MULE_PROJECTS_HOME environment variable is not set"
+        echo "Cannot list available applications"
+        exit 1
+    fi
+    
+    if [ ! -d "$MULE_PROJECTS_HOME" ]; then
+        echo "Error: MULE_PROJECTS_HOME directory does not exist: $MULE_PROJECTS_HOME"
+        exit 1
+    fi
+    
+    if [ -z "$MULE_SERVER_HOME" ]; then
+        echo "Error: MULE_SERVER_HOME environment variable is not set"
+        exit 1
+    fi
+    
+    # First show what's deployed but not in projects home
+    echo "Deployed applications not in $MULE_PROJECTS_HOME:"
+    echo ""
+    found_orphan=false
+    for deployed in "$MULE_SERVER_HOME/apps"/*.jar "$MULE_SERVER_HOME/apps"/*/; do
+        if [ -e "$deployed" ]; then
+            deployed_name=$(basename "$deployed" .jar)
+            deployed_name=$(basename "$deployed_name")
+            
+            # Skip the mule-domain-config apps
+            if [[ "$deployed_name" == *"mule-domain"* ]]; then
+                continue
+            fi
+            
+            # Check if this app exists in projects home
+            if [ ! -d "$MULE_PROJECTS_HOME/$deployed_name" ]; then
+                echo "  $deployed_name [ORPHANED]"
+                found_orphan=true
+            fi
+        fi
+    done
+    
+    if [ "$found_orphan" = false ]; then
+        echo "  (none)"
+    fi
+    
+    echo ""
+    echo "Available applications in $MULE_PROJECTS_HOME:"
+    echo ""
+    
+    # Find directories with pom.xml that have mule-application packaging
+    for dir in "$MULE_PROJECTS_HOME"/*/; do
+        if [ -f "${dir}pom.xml" ]; then
+            # Check if it's a Mule application
+            if grep -q "<packaging>mule-application</packaging>" "${dir}pom.xml" 2>/dev/null; then
+                app_name=$(basename "$dir")
+                
+                # Check if already deployed
+                deployed_status=""
+                if [ -f "$MULE_SERVER_HOME/apps/${app_name}.jar" ]; then
+                    deployed_status=" [DEPLOYED]"
+                elif [ -d "$MULE_SERVER_HOME/apps/${app_name}" ]; then
+                    deployed_status=" [DEPLOYED]"
+                fi
+                
+                printf "  %-30s%s\n" "$app_name" "$deployed_status"
+            fi
+        fi
+    done
+    echo ""
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -l|--list)
+            list_applications
+            exit 0
+            ;;
+        -h|--help)
+            show_usage
+            exit 0
+            ;;
+        -*)
+            echo "Error: Unknown option: $1"
+            echo ""
+            show_usage
+            exit 1
+            ;;
+        *)
+            APP_NAME="$1"
+            shift
+            ;;
+    esac
+    shift
+done
+
+# Check if MULE_SERVER_HOME is set
+if [ -z "$MULE_SERVER_HOME" ]; then
+    echo "Error: MULE_SERVER_HOME environment variable is not set"
+    exit 1
+fi
+
+# Check if REACTIVE_API_KEY is set
+if [ -z "$REACTIVE_API_KEY" ]; then
+    echo "Error: REACTIVE_API_KEY environment variable is not set"
+    exit 1
+fi
+
+# Check if REACTIVE_TENANT_ID is set
+if [ -z "$REACTIVE_TENANT_ID" ]; then
+    echo "Error: REACTIVE_TENANT_ID environment variable is not set"
+    exit 1
+fi
+
+# Determine the project directory
+if [ -n "$APP_NAME" ]; then
+    # Application name provided, look for it in MULE_PROJECTS_HOME
+    if [ -z "$MULE_PROJECTS_HOME" ]; then
+        echo "Error: MULE_PROJECTS_HOME environment variable is not set"
+        echo "Cannot deploy application by name without MULE_PROJECTS_HOME"
+        exit 1
+    fi
+    
+    if [ ! -d "$MULE_PROJECTS_HOME" ]; then
+        echo "Error: MULE_PROJECTS_HOME directory does not exist: $MULE_PROJECTS_HOME"
+        exit 1
+    fi
+    
+    # Look for the application directory
+    CURRENT_DIR="$MULE_PROJECTS_HOME/$APP_NAME"
+    
+    if [ ! -d "$CURRENT_DIR" ]; then
+        echo "Error: Application directory not found: $CURRENT_DIR"
+        echo ""
+        echo "Use --list to see available applications"
+        exit 1
+    fi
+    
+    if [ ! -f "$CURRENT_DIR/pom.xml" ]; then
+        echo "Error: No pom.xml found in $CURRENT_DIR"
+        exit 1
+    fi
+    
+    echo "Deploying application: $APP_NAME"
+    echo "From directory: $CURRENT_DIR"
+    echo ""
+    
+    # Change to the application directory
+    cd "$CURRENT_DIR" || exit 1
+else
+    # No application name provided, use current directory
+    CURRENT_DIR=$(pwd)
+fi
+
+# Check if local.properties exists, create if not
+LOCAL_PROPS_FILE="${CURRENT_DIR}/src/main/resources/local.properties"
+
+if [ ! -f "$LOCAL_PROPS_FILE" ]; then
+    echo "Creating local.properties file..."
+    mkdir -p "$(dirname "$LOCAL_PROPS_FILE")"
+    touch "$LOCAL_PROPS_FILE"
+fi
+
+# Try to determine project name from pom.xml or existing JAR
+if [ -f "pom.xml" ]; then
+    # Get the project's own artifactId (not the parent's)
+    # Look for artifactId that comes after <packaging>mule-application</packaging> or right after </parent>
+    PROJECT_NAME=$(awk '/<\/parent>/,/<artifactId>/ { if (/<artifactId>/) { gsub(/<\/?artifactId>/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print; exit } }' pom.xml | sed 's/-app$//')
+
+    # If that didn't work, try getting the artifactId with mule-application packaging
+    if [ -z "$PROJECT_NAME" ]; then
+        PROJECT_NAME=$(grep -B5 "<packaging>mule-application</packaging>" pom.xml | grep "<artifactId>" | tail -1 | sed 's/.*<artifactId>\(.*\)<\/artifactId>.*/\1/' | sed 's/-app$//')
+    fi
+
+    # Final fallback: use directory name
+    if [ -z "$PROJECT_NAME" ]; then
+        PROJECT_NAME=$(basename "$CURRENT_DIR")
+    fi
+else
+    # Fallback: try to find existing JAR to determine name
+    JAR_FILE=$(find "$CURRENT_DIR/target" -name "*-mule-application.jar" 2>/dev/null | head -n 1)
+    if [ -n "$JAR_FILE" ]; then
+        JAR_BASENAME=$(basename "$JAR_FILE")
+        PROJECT_NAME=$(echo "$JAR_BASENAME" | sed -E 's/^([^-]+-[^-]+).*-mule-application\.jar$/\1/')
+        if [[ "$PROJECT_NAME" == "$JAR_BASENAME" ]]; then
+            PROJECT_NAME=$(echo "$JAR_BASENAME" | sed -E 's/^([^-]+).*-mule-application\.jar$/\1/')
+        fi
+    else
+        echo "Error: Could not determine project name"
+        exit 1
+    fi
+fi
+
+echo "Project: ${PROJECT_NAME}"
+
+# Reactive Proxy API configuration
+REACTIVE_API_URL="http://localhost:4000/api"
+# Strip any whitespace/newlines from environment variables
+TENANT_ID="$(echo -n "${REACTIVE_TENANT_ID}" | tr -d '[:space:]')"
+API_KEY="$(echo -n "${REACTIVE_API_KEY}" | tr -d '[:space:]')"
+
+# Function to check if port is in use
+is_port_in_use() {
+    local port=$1
+    # Check if port is actually in use on the system
+    lsof -iTCP:$port -sTCP:LISTEN >/dev/null 2>&1
+}
+
+# Function to get next available port
+get_next_available_port() {
+    local BASE_PORT=8110
+    local MAX_PORT=8200
+
+    # Get all routing rules to find used ports
+    local RESPONSE=$(curl -s -X GET "${REACTIVE_API_URL}/tenants/${TENANT_ID}/routing-rules" \
+        -H "Accept: application/vnd.api+json" \
+        -H "Content-Type: application/vnd.api+json" \
+        -H "Authorization: Bearer ${API_KEY}" 2>/dev/null)
+
+    # Extract ports from target_host fields (looking for localhost:XXXX patterns)
+    local USED_PORTS_IN_RULES=$(echo "$RESPONSE" | grep -o '"target_host":"localhost:[0-9]*"' 2>/dev/null | sed 's/.*://;s/"//' | sort -n | uniq)
+
+    # Find the first available port
+    for ((port=$BASE_PORT; port<=$MAX_PORT; port++)); do
+        # Check if port is not in routing rules AND not actually in use on system
+        if ! echo "$USED_PORTS_IN_RULES" | grep -q "^${port}$" && ! is_port_in_use $port; then
+            echo $port
+            return
+        fi
+    done
+
+    echo "Error: No available ports in range $BASE_PORT-$MAX_PORT" >&2
+    exit 1
+}
+
+# Function to check if routing rule exists for this app
+get_existing_rule() {
+    local app_name=$1
+
+    # Get all routing rules
+    local RESPONSE=$(curl -s -w "\n%{http_code}" -X GET "${REACTIVE_API_URL}/tenants/${TENANT_ID}/routing-rules" \
+        -H "Accept: application/vnd.api+json" \
+        -H "Content-Type: application/vnd.api+json" \
+        -H "Authorization: Bearer ${API_KEY}" 2>/dev/null)
+
+    local HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+    # Remove last line (status code) - compatible with macOS
+    RESPONSE=$(echo "$RESPONSE" | sed '$d')
+
+    # Check if we got a valid JSON response
+    if [ "$HTTP_CODE" != "200" ]; then
+        echo "Warning: Failed to get routing rules (HTTP $HTTP_CODE)" >&2
+        return  # Return empty if API call failed
+    fi
+
+    if ! echo "$RESPONSE" | grep -q '"data"' 2>/dev/null; then
+        return  # Return empty if API call failed
+    fi
+
+    # Parse JSON to find the specific rule and its port
+    # Since the JSON might be on one line, we need a more robust approach
+    local RULE_INFO=$(echo "$RESPONSE" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    app_name = '${app_name}'
+    # Look for exact match with -rule suffix
+    for rule in data.get('data', []):
+        if rule['attributes']['name'] == app_name + '-rule':
+            trans = rule['attributes'].get('request_transformations', [])
+            if trans and len(trans) > 0:
+                target = trans[0].get('target_host', '')
+                if 'localhost:' in target:
+                    port = target.split(':')[1]
+                    print(f\"{rule['id']}:{port}\")
+                    sys.exit(0)
+except:
+    pass
+" 2>/dev/null)
+
+    echo "$RULE_INFO"
+}
+
+# Check if routing rule already exists for this app
+echo "Checking for existing routing rule for ${PROJECT_NAME}..."
+EXISTING_RULE=$(get_existing_rule "$PROJECT_NAME")
+
+if [ -n "$EXISTING_RULE" ]; then
+    RULE_ID=$(echo "$EXISTING_RULE" | cut -d: -f1)
+    ASSIGNED_PORT=$(echo "$EXISTING_RULE" | cut -d: -f2)
+    echo "Found existing routing rule for ${PROJECT_NAME}"
+    echo "Using existing port ${ASSIGNED_PORT} (Rule ID: ${RULE_ID})"
+else
+    echo "No existing routing rule found for ${PROJECT_NAME}"
+    # Assign a new port
+    ASSIGNED_PORT=$(get_next_available_port)
+
+    # Validate that we got a valid port number
+    if ! [[ "$ASSIGNED_PORT" =~ ^[0-9]+$ ]]; then
+        echo "Error: Failed to get a valid port number"
+        echo "Debug: Got '$ASSIGNED_PORT' instead of a port number"
+        exit 1
+    fi
+
+    echo "Assigned new port ${ASSIGNED_PORT} to ${PROJECT_NAME}"
+
+    # Create routing rule in Reactive Proxy
+    echo "Creating routing rule in Reactive Proxy..."
+
+    RULE_RESPONSE=$(curl -s -X POST "${REACTIVE_API_URL}/tenants/${TENANT_ID}/routing-rules" \
+        -H "Accept: application/vnd.api+json" \
+        -H "Content-Type: application/vnd.api+json" \
+        -H "Authorization: Bearer ${API_KEY}" \
+        -d "{
+            \"data\": {
+                \"type\": \"routing_rule\",
+                \"attributes\": {
+                    \"name\": \"${PROJECT_NAME}-rule\",
+                    \"description\": \"Route ${PROJECT_NAME} API to local mule server\",
+                    \"host_pattern\": \"mule.local:443\",
+                    \"priority\": 100,
+                    \"enabled\": true,
+                    \"continue\": false,
+                    \"tenant_id\": \"${TENANT_ID}\",
+                    \"conditions\": [
+                        {
+                            \"type\": \"path\",
+                            \"pattern\": \"/${PROJECT_NAME}/v1\",
+                            \"operator\": \"starts_with\"
+                        }
+                    ],
+                    \"request_transformations\": [
+                        {
+                            \"type\": \"rewrite_host\",
+                            \"target_host\": \"localhost:${ASSIGNED_PORT}\"
+                        }
+                    ],
+                    \"response_transformations\": []
+                }
+            }
+        }")
+
+    # Check if rule creation was successful
+    if echo "$RULE_RESPONSE" | grep -q '"id"'; then
+        RULE_ID=$(echo "$RULE_RESPONSE" | grep '"id":' | head -1 | sed 's/.*"id":"//;s/".*//')
+        echo "Successfully created routing rule (ID: ${RULE_ID})"
+    else
+        echo "Error: Failed to create routing rule in Reactive Proxy"
+        echo "Response: $RULE_RESPONSE"
+        echo ""
+        echo "Debug: API call details:"
+        echo "URL: ${REACTIVE_API_URL}/tenants/${TENANT_ID}/routing-rules"
+        echo "Project Name: ${PROJECT_NAME}"
+        echo "Port: ${ASSIGNED_PORT}"
+    fi
+fi
+
+# Update local.properties with the port
+echo ""
+echo "Updating local.properties with port ${ASSIGNED_PORT}..."
+
+# Update or add the https.listener.port property
+if grep -q "^https.listener.port=" "$LOCAL_PROPS_FILE"; then
+    # Property exists, update it
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        # macOS sed syntax
+        sed -i '' "s/^https.listener.port=.*/https.listener.port=${ASSIGNED_PORT}/" "$LOCAL_PROPS_FILE"
+    else
+        # GNU sed syntax
+        sed -i "s/^https.listener.port=.*/https.listener.port=${ASSIGNED_PORT}/" "$LOCAL_PROPS_FILE"
+    fi
+    echo "Updated existing https.listener.port property"
+else
+    # Property doesn't exist, add it
+    # First ensure the file ends with a newline
+    if [ -s "$LOCAL_PROPS_FILE" ] && [ -z "$(tail -c1 "$LOCAL_PROPS_FILE")" ]; then
+        # File ends with newline, just append
+        echo "https.listener.port=${ASSIGNED_PORT}" >> "$LOCAL_PROPS_FILE"
+    else
+        # File doesn't end with newline, add one first
+        echo "" >> "$LOCAL_PROPS_FILE"
+        echo "https.listener.port=${ASSIGNED_PORT}" >> "$LOCAL_PROPS_FILE"
+    fi
+    echo "Added https.listener.port property"
+fi
+
+# Run Maven build (ignore MAVEN_ARGS if set)
+echo ""
+echo "Building Mule application..."
+unset MAVEN_ARGS
+mvn clean package -DskipTests
+
+if [ $? -ne 0 ]; then
+    echo "Error: Maven build failed"
+    # Send notification if mule-reactor-notifier is available
+    if command -v mule-reactor-notifier &> /dev/null; then
+        mule-reactor-notifier "🚀 ❌" "Build failed: ${PROJECT_NAME}"
+    fi
+    exit 1
+else
+    # Send notification if mule-reactor-notifier is available
+    if command -v mule-reactor-notifier &> /dev/null; then
+        mule-reactor-notifier "🚀 ✅" "Build succeeded: ${PROJECT_NAME}"
+    fi
+fi
+
+echo ""
+
+# Find the JAR file in the target directory
+JAR_FILE=$(find "$CURRENT_DIR/target" -name "*-mule-application.jar" 2>/dev/null | head -n 1)
+
+if [ -z "$JAR_FILE" ]; then
+    echo "Error: No Mule application JAR file found in $CURRENT_DIR/target/"
+    exit 1
+fi
+
+# Destination file
+DEST_FILE="$MULE_SERVER_HOME/apps/${PROJECT_NAME}.jar"
+
+echo "Deploying Mule application..."
+echo "Source: $JAR_FILE"
+echo "Destination: $DEST_FILE"
+echo "Port: ${ASSIGNED_PORT}"
+echo "Access via proxy: http://localhost:8100/${PROJECT_NAME}/v1"
+
+# Copy the JAR file to the Mule apps directory
+cp "$JAR_FILE" "$DEST_FILE"
+
+if [ $? -eq 0 ]; then
+    echo ""
+    echo "Successfully deployed ${PROJECT_NAME}.jar to $MULE_SERVER_HOME/apps/"
+    echo "Application will be accessible on port ${ASSIGNED_PORT}"
+    echo "Via Reactive Proxy: http://localhost:8100/${PROJECT_NAME}/v1"
+else
+    echo "Error: Failed to copy JAR file"
+    exit 1
+fi

@@ -1,0 +1,556 @@
+#!/bin/bash
+
+# Local undeployment script for Mule applications
+# Removes JAR and anchor files from $MULE_SERVER_HOME/apps
+
+# Check if MULE_SERVER_HOME is set
+if [ -z "$MULE_SERVER_HOME" ]; then
+    echo "Error: MULE_SERVER_HOME environment variable is not set"
+    exit 1
+fi
+
+APPS_DIR="$MULE_SERVER_HOME/apps"
+
+# Safety check: Validate APPS_DIR
+if [ -z "$APPS_DIR" ] || [ "$APPS_DIR" = "/" ] || [ "$APPS_DIR" = "$HOME" ]; then
+    echo "ERROR: Invalid APPS_DIR path: '$APPS_DIR'"
+    exit 1
+fi
+
+if [ ! -d "$APPS_DIR" ]; then
+    echo "ERROR: APPS_DIR does not exist: $APPS_DIR"
+    exit 1
+fi
+
+# Parse command line arguments
+MODE="current"
+FORCE_MODE=false
+FORCE_ALL_MODE=false
+CLEAR_DATA=false
+SPECIFIC_APP=""
+
+# Check for force flags and clear-data flag first
+for arg in "$@"; do
+    if [ "$arg" == "-F" ] || [ "$arg" == "--force-all" ]; then
+        FORCE_MODE=true
+        FORCE_ALL_MODE=true
+    elif [ "$arg" == "-f" ] || [ "$arg" == "--force" ]; then
+        FORCE_MODE=true
+    fi
+    if [ "$arg" == "-c" ] || [ "$arg" == "--clear-data" ]; then
+        CLEAR_DATA=true
+    fi
+done
+
+# Parse main command
+if [ "$1" == "--list" ] || [ "$1" == "-l" ]; then
+    MODE="list"
+elif [ "$1" == "--all" ] || [ "$2" == "--all" ]; then
+    MODE="all"
+elif [ "$1" == "--others" ] || [ "$2" == "--others" ]; then
+    MODE="others"
+elif [ "$1" == "-F" ] || [ "$1" == "--force-all" ]; then
+    # Check if second argument is an app name
+    if [ -n "$2" ] && [[ ! "$2" =~ ^- ]]; then
+        MODE="specific"
+        SPECIFIC_APP="$2"
+    else
+        # Force-all flag only, use default mode
+        MODE="current"
+    fi
+elif [ "$1" == "-f" ] || [ "$1" == "--force" ]; then
+    # Check if second argument is an app name
+    if [ -n "$2" ] && [[ ! "$2" =~ ^- ]]; then
+        MODE="specific"
+        SPECIFIC_APP="$2"
+    else
+        # Force flag only, use default mode
+        MODE="current"
+    fi
+elif [ "$1" == "-c" ] || [ "$1" == "--clear-data" ]; then
+    # Check if second argument is an app name
+    if [ -n "$2" ] && [[ ! "$2" =~ ^- ]]; then
+        MODE="specific"
+        SPECIFIC_APP="$2"
+    else
+        # Clear-data flag only, use default mode (current directory)
+        MODE="current"
+    fi
+elif [ -n "$1" ] && [ "$1" != "--help" ] && [[ ! "$1" =~ ^- ]]; then
+    # If first argument is not a flag, treat it as an app name
+    MODE="specific"
+    SPECIFIC_APP="$1"
+elif [ -n "$1" ] && [ "$1" != "--help" ]; then
+    echo "Error: Unknown option '$1'"
+    echo ""
+    echo "Usage: undeploy-from-local [OPTIONS] [APP-NAME]"
+    echo ""
+    echo "Options:"
+    echo "  (no args)     - Undeploy the current app (from current directory)"
+    echo "  APP-NAME      - Undeploy a specific app by name"
+    echo "  -l, --list    - List all deployed apps"
+    echo "  --all         - Remove all deployed apps and anchor files"
+    echo "  --others      - Remove all apps except the current one"
+    echo "  -f, --force   - Force removal (delete anchor, wait, then delete folder)"
+    echo "  -F, --force-all - Force removal with rm -rf (more aggressive)"
+    echo "  -c, --clear-data - Clear app data from \$MULE_SERVER_HOME/.mule"
+    echo "  --help        - Show this help message"
+    echo ""
+    echo "Options can be combined: undeploy-from-local APP-NAME --force --clear-data"
+    echo "                         undeploy-from-local myapp -F -c"
+    exit 1
+elif [ "$1" == "--help" ]; then
+    echo "Usage: undeploy-from-local [OPTIONS] [APP-NAME]"
+    echo ""
+    echo "Local undeployment script for Mule applications."
+    echo "Removes JAR and anchor files from $MULE_SERVER_HOME/apps"
+    echo ""
+    echo "Options:"
+    echo "  (no args)     - Undeploy the current app (from current directory)"
+    echo "  APP-NAME      - Undeploy a specific app by name"
+    echo "  -l, --list    - List all deployed apps"
+    echo "  --all         - Remove all deployed apps and anchor files"
+    echo "  --others      - Remove all apps except the current one"
+    echo "  -f, --force   - Force removal (delete anchor, wait, then delete folder)"
+    echo "  -F, --force-all - Force removal with rm -rf (more aggressive)"
+    echo "  -c, --clear-data - Clear app data from \$MULE_SERVER_HOME/.mule"
+    echo "  --help        - Show this help message"
+    echo ""
+    echo "Options can be combined: undeploy-from-local APP-NAME --force --clear-data"
+    echo "                         undeploy-from-local myapp -F -c"
+    exit 0
+fi
+
+# Function to get project name from current directory
+get_current_project_name() {
+    local CURRENT_DIR=$(pwd)
+
+    # Try to find JAR file in target directory to extract project name
+    local JAR_FILE=$(find "$CURRENT_DIR/target" -name "*-mule-application.jar" 2>/dev/null | head -n 1)
+
+    if [ -z "$JAR_FILE" ]; then
+        # Fallback to directory name
+        echo $(basename "$CURRENT_DIR")
+    else
+        # Extract project name from JAR filename
+        local JAR_BASENAME=$(basename "$JAR_FILE")
+        local PROJECT_NAME=$(echo "$JAR_BASENAME" | sed -E 's/^([^-]+-[^-]+).*-mule-application\.jar$/\1/')
+
+        # If extraction fails, try alternative pattern for simpler names
+        if [[ "$PROJECT_NAME" == "$JAR_BASENAME" ]]; then
+            PROJECT_NAME=$(echo "$JAR_BASENAME" | sed -E 's/^([^-]+).*-mule-application\.jar$/\1/')
+        fi
+
+        echo "$PROJECT_NAME"
+    fi
+}
+
+# Function to clear app data from .mule directory
+clear_app_data() {
+    local app_name=$1
+
+    # Check if MULE_SERVER_HOME is set
+    if [ -z "$MULE_SERVER_HOME" ]; then
+        echo "Warning: MULE_SERVER_HOME not set, cannot clear app data"
+        return 1
+    fi
+
+    local mule_data_dir="$MULE_SERVER_HOME/.mule"
+    
+    if [ ! -d "$mule_data_dir" ]; then
+        echo "Warning: .mule directory doesn't exist: $mule_data_dir"
+        return 1
+    fi
+    
+    if [ "$app_name" == "ALL" ]; then
+        # Clear all content in .mule directory
+        echo "Clearing all app data from $mule_data_dir"
+        
+        # Safety check
+        if [ -z "$mule_data_dir" ] || [ "$mule_data_dir" = "/" ] || [ "$mule_data_dir" = "$HOME" ]; then
+            echo "ERROR: Refusing to clear dangerous path: '$mule_data_dir'"
+            return 1
+        fi
+        
+        # Remove all content but keep the directory itself
+        find "$mule_data_dir" -mindepth 1 -delete 2>/dev/null
+        if [ $? -eq 0 ]; then
+            echo "Cleared all app data from .mule directory"
+        else
+            echo "Warning: Some files could not be removed from .mule directory"
+        fi
+    else
+        # Clear specific app data
+        local app_data_dir="$mule_data_dir/apps/$app_name"
+        
+        if [ -d "$app_data_dir" ]; then
+            echo "Clearing app data for $app_name from $app_data_dir"
+            
+            # Safety check
+            if [ -z "$app_data_dir" ] || [ "$app_data_dir" = "/" ] || [ "$app_data_dir" = "$HOME" ]; then
+                echo "ERROR: Refusing to clear dangerous path: '$app_data_dir'"
+                return 1
+            fi
+            
+            if [ "$FORCE_ALL_MODE" = true ]; then
+                echo "[FORCE-ALL] Clearing app data with rm -rf: $app_data_dir"
+            fi
+            rm -rf "$app_data_dir"
+            if [ $? -eq 0 ]; then
+                echo "Cleared app data for $app_name"
+            else
+                echo "Warning: Could not remove app data directory: $app_data_dir"
+            fi
+        else
+            echo "No app data found for $app_name in .mule directory"
+        fi
+    fi
+}
+
+# Function to safely remove a directory with validation
+safe_remove_dir() {
+    local dir_to_remove=$1
+    local app_name=$2
+
+    # Safety checks before rm -rf
+    if [ -z "$dir_to_remove" ] || [ "$dir_to_remove" = "/" ] || [ "$dir_to_remove" = "$HOME" ]; then
+        echo "ERROR: Refusing to remove dangerous path: '$dir_to_remove'"
+        return 1
+    fi
+
+    # Ensure we're only removing from apps directory
+    if [[ "$dir_to_remove" != "$APPS_DIR/"* ]]; then
+        echo "ERROR: Refusing to remove directory outside apps folder: '$dir_to_remove'"
+        return 1
+    fi
+
+    # Ensure the directory name matches the app name
+    if [ "$(basename "$dir_to_remove")" != "$app_name" ]; then
+        echo "ERROR: Directory name mismatch. Expected: $app_name, Got: $(basename "$dir_to_remove")"
+        return 1
+    fi
+
+    # Double-check it's actually a directory
+    if [ ! -d "$dir_to_remove" ]; then
+        echo "Warning: Directory doesn't exist: $dir_to_remove"
+        return 1
+    fi
+
+    # Remove directory - use -rf if FORCE_ALL_MODE is set
+    if [ "$FORCE_ALL_MODE" = true ]; then
+        echo "[FORCE-ALL] Removing directory with rm -rf: $dir_to_remove"
+        rm -rf "$dir_to_remove"
+    else
+        echo "Removing directory: $dir_to_remove"
+        rm -r "$dir_to_remove"
+    fi
+    return 0
+}
+
+# Function to remove an app and its anchor file and folder
+remove_app() {
+    local app_name=$1
+
+    # Validate app_name is not empty or dangerous
+    if [ -z "$app_name" ] || [ "$app_name" = "/" ] || [ "$app_name" = "." ] || [ "$app_name" = ".." ]; then
+        echo "ERROR: Invalid app name: '$app_name'"
+        return 1
+    fi
+
+    local jar_file="${APPS_DIR}/${app_name}.jar"
+    local anchor_file="${APPS_DIR}/${app_name}-anchor.txt"
+    local app_folder="${APPS_DIR}/${app_name}"
+
+    local removed=false
+
+    # In force mode, delete anchor first to trigger Mule to stop the app
+    if [ "$FORCE_MODE" = true ] && [ -f "$anchor_file" ]; then
+        echo "[FORCE] Removing anchor file to stop app: ${app_name}-anchor.txt"
+        rm "$anchor_file"
+        echo "[FORCE] Waiting 3 seconds for Mule to stop the app..."
+        sleep 3
+        removed=true
+    fi
+
+    if [ -f "$jar_file" ]; then
+        echo "Removing: ${app_name}.jar"
+        rm "$jar_file"
+        removed=true
+    fi
+
+    # Remove anchor file if not in force mode (in force mode it's already removed)
+    if [ "$FORCE_MODE" = false ] && [ -f "$anchor_file" ]; then
+        echo "Removing: ${app_name}-anchor.txt"
+        rm "$anchor_file"
+        removed=true
+    fi
+
+    # If we removed JAR or anchor file, wait for Mule to process the changes
+    # (Skip if force mode since we already waited after removing anchor)
+    if [ "$removed" = true ] && [ "$FORCE_MODE" = false ]; then
+        echo "Waiting 3 seconds for Mule to process undeployment..."
+        sleep 3
+    fi
+
+    # Check the expanded app folder after waiting
+    if [ -d "$app_folder" ]; then
+        if [ "$FORCE_MODE" = true ]; then
+            # In force mode, always remove the folder after waiting
+            echo "[FORCE] Preparing to remove app folder: ${app_name}/"
+            if safe_remove_dir "$app_folder" "$app_name"; then
+                removed=true
+            fi
+        else
+            # In normal mode, check if folder still exists after wait
+            echo "App folder still exists: ${app_name}/ (use --force to remove)"
+        fi
+    fi
+
+    if [ "$removed" = false ]; then
+        echo "App not found: ${app_name}"
+    else
+        # Clear app data from .mule if requested
+        if [ "$CLEAR_DATA" = true ]; then
+            clear_app_data "$app_name"
+        fi
+    fi
+}
+
+# Main logic based on mode
+case $MODE in
+    "list")
+        # List all deployed apps
+        echo "Deployed applications in $APPS_DIR:"
+        echo ""
+
+        # Header
+        printf "%-30s %-12s %-10s %-15s %s\n" "Application" "JAR" "Anchor" "Folder" "Status"
+        printf "%-30s %-12s %-10s %-15s %s\n" "-----------" "---" "------" "------" "------"
+
+        # List JAR files and their status
+        for jar in "$APPS_DIR"/*.jar; do
+            if [ -f "$jar" ]; then
+                app_name=$(basename "$jar" .jar)
+
+                # Skip libraries
+                if [[ "$app_name" =~ ^lib- ]]; then
+                    continue
+                fi
+
+                jar_size=$(ls -lh "$jar" | awk '{print $5}')
+                anchor_file="${APPS_DIR}/${app_name}-anchor.txt"
+                app_folder="${APPS_DIR}/${app_name}"
+
+                # Check components
+                jar_status="Yes ${jar_size}"
+
+                if [ -f "$anchor_file" ]; then
+                    anchor_status="Yes"
+                else
+                    anchor_status="-"
+                fi
+
+                if [ -d "$app_folder" ]; then
+                    folder_size=$(du -sh "$app_folder" 2>/dev/null | awk '{print $1}')
+                    folder_status="Yes ${folder_size}"
+                else
+                    folder_status="-"
+                fi
+
+                # Determine overall status
+                if [ -f "$anchor_file" ]; then
+                    overall_status="Deployed"
+                else
+                    overall_status="Deployed (no anchor)"
+                fi
+
+                printf "%-30s %-12s %-10s %-15s %s\n" "$app_name" "$jar_status" "$anchor_status" "$folder_status" "$overall_status"
+            fi
+        done
+
+        # List apps without JARs (normal for running apps)
+        for dir in "$APPS_DIR"/*/; do
+            if [ -d "$dir" ]; then
+                app_name=$(basename "$dir")
+
+                # Skip libraries
+                if [[ "$app_name" =~ ^lib- ]]; then
+                    continue
+                fi
+
+                jar_file="${APPS_DIR}/${app_name}.jar"
+                anchor_file="${APPS_DIR}/${app_name}-anchor.txt"
+
+                # Only show if JAR doesn't exist
+                if [ ! -f "$jar_file" ]; then
+                    folder_size=$(du -sh "$dir" 2>/dev/null | awk '{print $1}')
+
+                    if [ -f "$anchor_file" ]; then
+                        anchor_status="Yes"
+                        status="Deployed"
+                    else
+                        anchor_status="-"
+                        status="Orphaned"
+                        has_orphaned=true
+                    fi
+
+                    printf "%-30s %-12s %-10s %-15s %s\n" "$app_name" "-" "$anchor_status" "Yes ${folder_size}" "$status"
+                fi
+            fi
+        done
+
+        # Check for orphaned anchor files (anchor without JAR)
+        for anchor in "$APPS_DIR"/*-anchor.txt; do
+            if [ -f "$anchor" ]; then
+                anchor_name=$(basename "$anchor")
+                app_name=${anchor_name%-anchor.txt}
+
+                jar_file="${APPS_DIR}/${app_name}.jar"
+                app_folder="${APPS_DIR}/${app_name}"
+
+                # Only show if JAR doesn't exist and folder doesn't exist (truly orphaned anchor)
+                if [ ! -f "$jar_file" ] && [ ! -d "$app_folder" ]; then
+                    has_orphaned=true
+                    printf "%-30s %-12s %-10s %-15s %s\n" "$app_name" "-" "Yes" "-" "Orphaned anchor"
+                fi
+            fi
+        done
+
+        echo ""
+        # Count actual apps (with JARs)
+        jar_count=$(ls "$APPS_DIR"/*.jar 2>/dev/null | wc -l | tr -d ' ')
+        # Count apps with folders
+        folder_count=$(find "$APPS_DIR" -maxdepth 1 -type d -not -name "." -not -name ".." -not -name "lib-*" 2>/dev/null | wc -l | tr -d ' ')
+
+        echo "Summary:"
+        # Count deployed apps (with anchor)
+        deployed_count=$(ls "$APPS_DIR"/*-anchor.txt 2>/dev/null | wc -l | tr -d ' ')
+
+        if [ "$deployed_count" -gt 0 ]; then
+            echo "  Deployed apps: $deployed_count"
+        fi
+        if [ "$jar_count" -gt 0 ]; then
+            echo "  Apps with JAR files: $jar_count"
+        fi
+        if [ "$has_orphaned" = true ]; then
+            echo "  Orphaned items found (use --force to clean up)"
+        fi
+        ;;
+
+    "current")
+        # Undeploy current app
+        PROJECT_NAME=$(get_current_project_name)
+        echo "Undeploying current app: ${PROJECT_NAME}"
+        remove_app "$PROJECT_NAME"
+        ;;
+
+    "specific")
+        # Undeploy specific app by name
+        echo "Undeploying app: ${SPECIFIC_APP}"
+        remove_app "$SPECIFIC_APP"
+        ;;
+
+    "all")
+        # Remove all apps
+        echo "Removing all deployed apps..."
+
+        # Find all JAR files (excluding libraries)
+        for jar in "$APPS_DIR"/*.jar; do
+            if [ -f "$jar" ]; then
+                app_name=$(basename "$jar" .jar)
+                # Skip if it's a library or system file (basic check)
+                if [[ ! "$app_name" =~ ^lib- ]]; then
+                    remove_app "$app_name"
+                fi
+            fi
+        done
+
+        # Also clean up any orphaned anchor files
+        for anchor in "$APPS_DIR"/*-anchor.txt; do
+            if [ -f "$anchor" ]; then
+                anchor_name=$(basename "$anchor")
+                app_name=${anchor_name%-anchor.txt}
+                # Only remove if JAR doesn't exist (orphaned)
+                if [ ! -f "${APPS_DIR}/${app_name}.jar" ]; then
+                    echo "Removing orphaned: $anchor_name"
+                    rm "$anchor"
+                fi
+            fi
+        done
+
+        # Clean up orphaned app folders only in force mode
+        if [ "$FORCE_MODE" = true ]; then
+            for dir in "$APPS_DIR"/*/; do
+                if [ -d "$dir" ]; then
+                    app_name=$(basename "$dir")
+                    # Skip if it's a library or system folder
+                    if [[ ! "$app_name" =~ ^lib- ]]; then
+                        anchor_file="${APPS_DIR}/${app_name}-anchor.txt"
+                        jar_file="${APPS_DIR}/${app_name}.jar"
+                        # Remove folder if both anchor and JAR are gone (truly orphaned)
+                        if [ ! -f "$anchor_file" ] && [ ! -f "$jar_file" ]; then
+                            echo "[FORCE] Removing orphaned app folder: ${app_name}/"
+                            safe_remove_dir "$dir" "$app_name"
+                        fi
+                    fi
+                fi
+            done
+        fi
+        
+        # Clear all app data from .mule if requested
+        if [ "$CLEAR_DATA" = true ]; then
+            clear_app_data "ALL"
+        fi
+        ;;
+
+    "others")
+        # Remove all except current app
+        CURRENT_PROJECT=$(get_current_project_name)
+        echo "Removing all apps except: ${CURRENT_PROJECT}"
+
+        # Find all JAR files
+        for jar in "$APPS_DIR"/*.jar; do
+            if [ -f "$jar" ]; then
+                app_name=$(basename "$jar" .jar)
+                # Skip if it's the current project or a library
+                if [[ "$app_name" != "$CURRENT_PROJECT" ]] && [[ ! "$app_name" =~ ^lib- ]]; then
+                    remove_app "$app_name"
+                fi
+            fi
+        done
+
+        # Clean up orphaned anchor files (except current)
+        for anchor in "$APPS_DIR"/*-anchor.txt; do
+            if [ -f "$anchor" ]; then
+                anchor_name=$(basename "$anchor")
+                app_name=${anchor_name%-anchor.txt}
+                # Remove if orphaned and not current project
+                if [ ! -f "${APPS_DIR}/${app_name}.jar" ] && [ "$app_name" != "$CURRENT_PROJECT" ]; then
+                    echo "Removing orphaned: $anchor_name"
+                    rm "$anchor"
+                fi
+            fi
+        done
+
+        # Clean up orphaned app folders (except current) only in force mode
+        if [ "$FORCE_MODE" = true ]; then
+            for dir in "$APPS_DIR"/*/; do
+                if [ -d "$dir" ]; then
+                    app_name=$(basename "$dir")
+                    # Skip if it's the current project or a library
+                    if [[ "$app_name" != "$CURRENT_PROJECT" ]] && [[ ! "$app_name" =~ ^lib- ]]; then
+                        anchor_file="${APPS_DIR}/${app_name}-anchor.txt"
+                        jar_file="${APPS_DIR}/${app_name}.jar"
+                        # Remove folder if both anchor and JAR are gone (truly orphaned)
+                        if [ ! -f "$anchor_file" ] && [ ! -f "$jar_file" ]; then
+                            echo "[FORCE] Removing orphaned app folder: ${app_name}/"
+                            safe_remove_dir "$dir" "$app_name"
+                        fi
+                    fi
+                fi
+            done
+        fi
+        ;;
+esac
+
+echo "Done."

@@ -1,0 +1,159 @@
+#!/usr/bin/env ruby
+
+# Initialize options with default values
+require 'optparse'
+require 'ostruct'
+
+options = OpenStruct.new(verbose: false, stale: false)
+
+parser  = OptionParser.new do |parser|
+  parser.banner = "Usage: ruby #{File.basename(__FILE__)} [options]"
+
+  parser.on("-h", "--help", "Display this help and exit") do
+    puts parser
+    exit
+  end
+
+  parser.on("-s", "--stale", "Run tests for files modified since last commit") do
+    options.stale = true
+  end
+
+end
+
+args = parser.parse!(ARGV)
+
+# Function to find test files for modified files
+def find_stale_tests
+  # Get list of modified files since last commit
+  modified_files = `git diff --name-only HEAD`.split("\n")
+  modified_files += `git diff --name-only --cached`.split("\n")
+  modified_files.uniq!
+
+  test_files = []
+
+  modified_files.each do |file|
+    # Check if it's already a test file
+    if file =~ /src\/test\/munit\/(.+\.xml)$/
+      test_files << $1
+    # Check if it's an implementation file
+    elsif file =~ /src\/main\/mule\/(.+)\.xml$/
+      impl_name = $1
+
+      # Look for corresponding test files
+      # Pattern 1: implementation-test-suite.xml
+      # Pattern 2: implementation-suite.xml
+      # Pattern 3: implementation-test.xml
+      possible_tests = [
+        "#{impl_name}-test-suite.xml",
+        "#{impl_name}-suite.xml",
+        "#{impl_name}-test.xml",
+        "#{impl_name}.xml"
+      ]
+
+      possible_tests.each do |test_file|
+        if File.exist?("src/test/munit/#{test_file}")
+          test_files << test_file
+          break
+        end
+      end
+    end
+  end
+
+  test_files.uniq
+end
+
+if options.stale
+  stale_tests = find_stale_tests
+  if stale_tests.any?
+    puts "Found modified files with tests: #{stale_tests.join(', ')}"
+    options.files_to_test = stale_tests
+  else
+    puts "No modified files with tests found"
+    exit 0
+  end
+elsif args.any?
+  # Support multiple test files
+  options.files_to_test = args.map { |arg| File.basename(arg) }
+end
+
+
+def send_notification(title, message)
+  # Check if mule-reactor-notifier is available in PATH
+  if system("which mule-reactor-notifier > /dev/null 2>&1")
+    system "mule-reactor-notifier \"#{title}\" \"#{message}\""
+  end
+end
+
+
+@test_summary = {}
+def capture_test_summary(line)
+  case line
+  when /No tests suites were found!/
+    @test_summary[:no_tests] = true
+  when /  > Tests:\s+(\d+)/
+    @test_summary[:tests] = $1.to_i
+  when /  > Errors:\s+(\d+)/
+    @test_summary[:errors] = $1.to_i
+  when /  > Failures:\s+(\d+)/
+    @test_summary[:failures] = $1.to_i
+  when /  > Skipped:\s+(\d+)/
+    @test_summary[:skipped] = $1.to_i
+  end
+end
+
+def test_summary
+  if @test_summary[:no_tests] == true
+  "No tests suites were found!"
+  else
+  "Tests: #{@test_summary[:tests]}\nErrors: #{@test_summary[:errors]}\nFailures: #{@test_summary[:failures]}\nSkipped: #{@test_summary[:skipped]}"
+  end
+end
+
+def run(options)
+  # Handle multiple test files
+  test_files = options.files_to_test
+
+  if test_files.nil? || test_files.empty?
+    # Run all tests if no specific files specified
+    mvn_command = "mvn clean test"
+  else
+    if test_files.length > 1
+      puts "Running tests: #{test_files.join(', ')}"
+      # Try using a regex pattern that matches any of the specified files
+      # Remove .xml extension and create pattern like: (test1|test2|test3).*\.xml
+      test_names = test_files.map { |f| f.gsub('.xml', '') }
+      pattern = "(#{test_names.join('|')}).*\\.xml"
+      mvn_command = "mvn clean test \"-Dmunit.test=#{pattern}\""
+    else
+      puts "Running test: #{test_files.first}"
+      mvn_command = "mvn clean test -Dmunit.test=#{test_files.first}"
+    end
+  end
+
+  puts "Executing: #{mvn_command}"
+  IO.popen(mvn_command) do |io|
+    io.each do |line| 
+      puts line 
+      capture_test_summary(line)
+    end
+    io.close
+  end
+  exit_status = $?.exitstatus
+  if exit_status == 0
+    send_notification('🫏 ✅', test_summary)
+  else
+    send_notification('🫏 ❌', test_summary)
+    pattern = "target/surefire-reports/munit*.txt"
+    files = Dir.glob(pattern)
+    files.map do |file|
+      File.foreach(file) { |line| puts line }
+    end 
+  end
+  # Return the exit status so it can be used by the caller
+  exit_status
+end
+
+if __FILE__ == $PROGRAM_NAME
+  exit_status = run(options)
+  exit(exit_status)
+end
