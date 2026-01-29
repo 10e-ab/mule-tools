@@ -7,7 +7,18 @@ require 'ostruct'
 options = OpenStruct.new(verbose: false, stale: false)
 
 parser  = OptionParser.new do |parser|
-  parser.banner = "Usage: ruby #{File.basename(__FILE__)} [options]"
+  parser.banner = "Usage: #{File.basename(__FILE__)} [options] [test-file...]"
+  parser.separator ""
+  parser.separator "Run MUnit tests for Mule applications."
+  parser.separator ""
+  parser.separator "Examples:"
+  parser.separator "  #{File.basename(__FILE__)}                           # Run all tests"
+  parser.separator "  #{File.basename(__FILE__)} test-suite.xml            # Run specific test suite"
+  parser.separator "  #{File.basename(__FILE__)} test-suite.xml#testName   # Run specific test within suite"
+  parser.separator "  #{File.basename(__FILE__)} test1.xml test2.xml       # Run multiple test suites"
+  parser.separator "  #{File.basename(__FILE__)} -s                        # Run tests for modified files"
+  parser.separator ""
+  parser.separator "Options:"
 
   parser.on("-h", "--help", "Display this help and exit") do
     puts parser

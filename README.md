@@ -15,6 +15,7 @@ mule-tools/
     ├── deploy-to-local-completion.bash      # Bash completion for deploy
     ├── deploy-to-local-completion.nu        # Nushell completion for deploy
     ├── munit-completion.bash                # Bash completion for munit
+    ├── munit-completion.zsh                 # Zsh completion for munit
     ├── munit-completion.nu                  # Nushell completion for munit
     ├── undeploy-from-local-completion.bash  # Bash completion for undeploy
     └── undeploy-from-local-completion.nu    # Nushell completion for undeploy
@@ -63,6 +64,16 @@ export MULE_PROJECTS_HOME="/path/to/mule/projects"
    source ~/projects/mule-tools/completion/undeploy-from-local-completion.bash
    ```
 
+   ### Zsh Completions
+   ```zsh
+   # Add to ~/.zshrc
+   fpath=(~/projects/mule-tools/completion $fpath)
+   autoload -Uz compinit && compinit
+
+   # Or source directly
+   source ~/projects/mule-tools/completion/munit-completion.zsh
+   ```
+
    ### Nushell Completions
    ```bash
    # Copy completion files to Nushell config directory
@@ -99,15 +110,15 @@ munit
 # Run specific test file
 munit test-suite.xml
 
+# Run specific test within a suite
+munit test-suite.xml#testName
+
 # Run multiple test files
 munit test1.xml test2.xml test3.xml
 
 # Run tests for modified files since last commit
 munit --stale
 munit -s
-
-# Run a specific test file
-munit test-suite.xml
 ```
 
 #### Options
@@ -115,8 +126,10 @@ munit test-suite.xml
 - `-s, --stale` - Run tests for files modified since last commit
 
 #### Features
+- **Individual test support**: Run a single test within a suite using `file.xml#testName` syntax
 - **Multiple test support**: Run several test files in one command
 - **Smart completion**: Tab completion shows available test files from `src/test/munit/`
+- **Test name completion**: Type `file.xml#` and press Tab to see available test names
 - **Change detection**: `--stale` flag automatically runs tests for modified files
 - **Implementation mapping**: Automatically finds test files for modified implementation files
   - Maps `implementation.xml` → `implementation-test-suite.xml` or `implementation-suite.xml`
@@ -126,11 +139,14 @@ munit test-suite.xml
 # Run tests for recent changes
 munit --stale
 
-# Run specific tests
-munit health-test-suite.xml api-test-suite.xml
+# Run specific test suite
+munit health-test-suite.xml
 
-# Run all tests matching a pattern (uses regex)
-munit "*api*.xml"
+# Run a single test within a suite
+munit health-test-suite.xml#pingShouldReturnStatusUpTest
+
+# Run multiple test suites
+munit health-test-suite.xml api-test-suite.xml
 ```
 
 ### deploy-to-local
@@ -229,13 +245,19 @@ undeploy-from-local problematic-app -F
 
 ### Bash
 Tab completion is available for all commands:
-- **munit**: Completes test file names from `src/test/munit/`, supports multiple selections
+- **munit**: Completes test file names from `src/test/munit/`, supports multiple selections. Type `file.xml#` and press Tab to see individual test names within that file.
+- **deploy-to-local**: Completes application names from `$MULE_PROJECTS_HOME`
+- **undeploy-from-local**: Completes deployed application names
+
+### Zsh
+Full completion support with descriptions:
+- **munit**: Completes test file names with test counts, and individual test names. Type `file.xml#` and press Tab to see individual test names.
 - **deploy-to-local**: Completes application names from `$MULE_PROJECTS_HOME`
 - **undeploy-from-local**: Completes deployed application names
 
 ### Nushell
 Full completion support for all commands:
-- **munit**: Completes test file names from `src/test/munit/`
+- **munit**: Completes test file names from `src/test/munit/`. Type `file.xml#` and press Tab to see individual test names within that file.
 - **deploy-to-local**: Completes application names from `$MULE_PROJECTS_HOME`
 - **undeploy-from-local**: Completes deployed application names
 

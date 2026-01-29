@@ -2,6 +2,16 @@
 
 # Bash completion for munit command
 
+# Extract test names from an MUnit XML file
+_munit_get_test_names() {
+    local file="$1"
+    if [ -f "$file" ]; then
+        # Extract test names from munit:test name="..." attributes
+        # Using sed for macOS compatibility (grep -P not available)
+        sed -n 's/.*<munit:test[^>]*name="\([^"]*\)".*/\1/p' "$file" 2>/dev/null
+    fi
+}
+
 _munit_completion() {
     local cur prev opts
     COMPREPLY=()
@@ -20,6 +30,25 @@ _munit_completion() {
 
     # Check if we're in a Mule project with munit tests
     if [ -d "$munit_dir" ]; then
+        # Check if user is typing a test name after file#
+        if [[ "$cur" == *"#"* ]]; then
+            # Extract the file part and the partial test name
+            local file_part="${cur%%#*}"
+            local test_part="${cur#*#}"
+            local full_path="${munit_dir}/${file_part}"
+
+            # Get test names from the file
+            if [ -f "$full_path" ]; then
+                local test_names=$(_munit_get_test_names "$full_path")
+                local completions=""
+                for test_name in $test_names; do
+                    completions="${completions} ${file_part}#${test_name}"
+                done
+                COMPREPLY=( $(compgen -W "${completions}" -- ${cur}) )
+            fi
+            return 0
+        fi
+
         # Find all XML test files in src/test/munit
         local test_files=""
 
@@ -31,7 +60,9 @@ _munit_completion() {
                 # Check if this file has already been specified
                 local already_specified=false
                 for word in "${COMP_WORDS[@]:1:$((COMP_CWORD-1))}"; do
-                    if [[ "$word" == "$filename" ]]; then
+                    # Check if file (without #testName) was already specified
+                    local word_file="${word%%#*}"
+                    if [[ "$word_file" == "$filename" ]]; then
                         already_specified=true
                         break
                     fi
@@ -46,7 +77,7 @@ _munit_completion() {
         # Offer test files and options based on position and context
         if [[ ${COMP_CWORD} -eq 1 ]]; then
             # First argument: offer test files and options
-            local options="--help --version --stale -s"
+            local options="--help --stale -s -h"
             local all_completions="${test_files} ${options}"
             COMPREPLY=( $(compgen -W "${all_completions}" -- ${cur}) )
         else
@@ -58,7 +89,7 @@ _munit_completion() {
     else
         # If not in a Mule project, just offer help options
         if [[ ${COMP_CWORD} -eq 1 ]]; then
-            local options="--help --version"
+            local options="--help -h"
             COMPREPLY=( $(compgen -W "${options}" -- ${cur}) )
         fi
     fi
