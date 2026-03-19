@@ -49,7 +49,7 @@ _munit_completion() {
             return 0
         fi
 
-        # Find all XML test files in src/test/munit
+        # Find all XML test files and individual tests in src/test/munit
         local test_files=""
 
         # Get all XML files in the munit directory
@@ -70,6 +70,11 @@ _munit_completion() {
                 # Only add if not already specified
                 if [ "$already_specified" = false ]; then
                     test_files="${test_files} ${filename}"
+                    # Also add individual tests as file#testName
+                    local test_names=$(_munit_get_test_names "$file")
+                    for test_name in $test_names; do
+                        test_files="${test_files} ${filename}#${test_name}"
+                    done
                 fi
             fi
         done
